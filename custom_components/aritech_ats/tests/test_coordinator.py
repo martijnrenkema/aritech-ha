@@ -8,6 +8,7 @@ from pathlib import Path
 _custom_components_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_custom_components_dir))
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -521,3 +522,140 @@ async def test_coordinator_deactivate_trigger(hass: HomeAssistant) -> None:
 
         await coordinator.async_deactivate_trigger(1)
         mock_client.deactivate_trigger.assert_called_once_with(1)
+
+
+def _patch_client_and_monitor(clients: list[MagicMock]):
+    """Patch client/monitor so every connect gets the next mock client."""
+    return (
+        patch("aritech_ats.coordinator.AritechClient", side_effect=clients),
+        patch(
+            "aritech_ats.coordinator.AritechMonitor",
+            side_effect=lambda _client: create_mock_monitor(),
+        ),
+    )
+
+
+async def _wait_for_reconnect(coordinator: AritechCoordinator) -> None:
+    """Wait until the running reconnect loop has finished."""
+    task = coordinator._reconnect_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
+
+
+async def test_coordinator_reconnects_after_every_connection_loss(
+    hass: HomeAssistant,
+) -> None:
+    """Test that a second connection loss still triggers a reconnect."""
+    clients = [create_mock_client() for _ in range(3)]
+    entry = create_mock_config_entry(hass)
+    patch_client, patch_monitor = _patch_client_and_monitor(clients)
+
+    with patch_client, patch_monitor:
+        coordinator = AritechCoordinator(hass, entry)
+        coordinator._reconnect_delays = [0]
+        await coordinator.async_connect()
+
+        for expected_client in clients[1:]:
+            coordinator._handle_connection_lost()
+            assert coordinator.connected is False
+
+            await _wait_for_reconnect(coordinator)
+
+            assert coordinator.connected is True
+            assert coordinator.client is expected_client
+            assert coordinator._shutting_down is False
+            assert coordinator._reconnect_attempt == 0
+
+        await coordinator.async_disconnect()
+
+
+async def test_coordinator_keeps_retrying_after_failed_reconnect(
+    hass: HomeAssistant,
+) -> None:
+    """Test that a failed reconnect attempt is followed by another attempt."""
+    failing_client = create_mock_client()
+    failing_client.connect = AsyncMock(side_effect=OSError("No route to host"))
+    clients = [create_mock_client(), failing_client, failing_client, create_mock_client()]
+    entry = create_mock_config_entry(hass)
+    patch_client, patch_monitor = _patch_client_and_monitor(clients)
+
+    with patch_client, patch_monitor:
+        coordinator = AritechCoordinator(hass, entry)
+        coordinator._reconnect_delays = [0]
+        await coordinator.async_connect()
+
+        coordinator._handle_connection_lost()
+        await _wait_for_reconnect(coordinator)
+
+        assert failing_client.connect.await_count == 2
+        assert coordinator.connected is True
+        assert coordinator.client is clients[-1]
+
+        await coordinator.async_disconnect()
+
+
+async def test_coordinator_reconnects_when_disconnect_fails(hass: HomeAssistant) -> None:
+    """Test that an error while closing the dead connection doesn't block reconnect."""
+    clients = [create_mock_client(), create_mock_client()]
+    clients[0].disconnect = AsyncMock(side_effect=OSError("Broken pipe"))
+    entry = create_mock_config_entry(hass)
+    patch_client, patch_monitor = _patch_client_and_monitor(clients)
+
+    with patch_client, patch_monitor:
+        coordinator = AritechCoordinator(hass, entry)
+        coordinator._reconnect_delays = [0]
+        await coordinator.async_connect()
+
+        coordinator._handle_connection_lost()
+        await _wait_for_reconnect(coordinator)
+
+        assert coordinator.connected is True
+        assert coordinator.client is clients[1]
+
+        await coordinator.async_disconnect()
+
+
+async def test_coordinator_ignores_connection_lost_from_old_client(
+    hass: HomeAssistant,
+) -> None:
+    """Test that a late callback of a replaced client doesn't drop the new connection."""
+    clients = [create_mock_client(), create_mock_client()]
+    entry = create_mock_config_entry(hass)
+    patch_client, patch_monitor = _patch_client_and_monitor(clients)
+
+    with patch_client, patch_monitor:
+        coordinator = AritechCoordinator(hass, entry)
+        coordinator._reconnect_delays = [0]
+        await coordinator.async_connect()
+
+        coordinator._handle_connection_lost(clients[0])
+        await _wait_for_reconnect(coordinator)
+        assert coordinator.connected is True
+
+        coordinator._handle_connection_lost(clients[0])
+
+        assert coordinator.connected is True
+        assert coordinator._reconnect_task.done()
+
+        await coordinator.async_disconnect()
+
+
+async def test_coordinator_disconnect_stops_reconnect_loop(hass: HomeAssistant) -> None:
+    """Test that unloading cancels a pending reconnect."""
+    clients = [create_mock_client()]
+    entry = create_mock_config_entry(hass)
+    patch_client, patch_monitor = _patch_client_and_monitor(clients)
+
+    with patch_client, patch_monitor:
+        coordinator = AritechCoordinator(hass, entry)
+        coordinator._reconnect_delays = [300]
+        await coordinator.async_connect()
+
+        coordinator._handle_connection_lost()
+        assert coordinator._reconnect_task is not None
+
+        await coordinator.async_disconnect()
+
+        assert coordinator._reconnect_task is None
+        assert coordinator._shutting_down is True
+        assert coordinator.connected is False

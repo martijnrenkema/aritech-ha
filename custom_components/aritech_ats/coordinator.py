@@ -22,6 +22,7 @@ from .const import (
     PANEL_TYPE_X700,
     CONNECT_TIMEOUT,
     INITIALIZE_TIMEOUT,
+    DISCONNECT_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,6 +129,8 @@ class AritechCoordinator(DataUpdateCoordinator[AritechData]):
         else:
             client_config["pin"] = config.get(CONF_PIN_CODE, "")
 
+        self._shutting_down = False
+        self._initialized.clear()
         self._client = AritechClient(client_config)
 
         try:
@@ -166,25 +169,19 @@ class AritechCoordinator(DataUpdateCoordinator[AritechData]):
         except asyncio.TimeoutError as err:
             self._connected = False
             _LOGGER.error("Timeout connecting to Aritech panel at %s:%s", config[CONF_HOST], config[CONF_PORT])
-            await self.async_disconnect()
+            await self._async_teardown()
             raise UpdateFailed("Connection timed out") from err
         except Exception as err:
             self._connected = False
             _LOGGER.error("Failed to connect to Aritech panel: %s", err)
-            await self.async_disconnect()
+            await self._async_teardown()
             raise UpdateFailed(f"Failed to connect: {err}") from err
 
-    async def async_disconnect(self, _from_reconnect: bool = False) -> None:
-        """Disconnect from the alarm panel.
-
-        Args:
-            _from_reconnect: True when called from within the reconnect task,
-                to avoid the task trying to cancel and await itself.
-        """
+    async def async_disconnect(self) -> None:
+        """Disconnect from the alarm panel and stop reconnecting."""
         self._shutting_down = True
 
-        # Cancel any pending reconnect task (but not if we're inside it)
-        if not _from_reconnect and self._reconnect_task and not self._reconnect_task.done():
+        if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             try:
                 await self._reconnect_task
@@ -192,21 +189,39 @@ class AritechCoordinator(DataUpdateCoordinator[AritechData]):
                 pass
         self._reconnect_task = None
 
-        if self._monitor:
-            self._monitor.stop()
-            self._monitor = None
-
-        if self._client:
-            await self._client.disconnect()
-            self._client = None
-
-        self._connected = False
+        await self._async_teardown()
         _LOGGER.debug("Disconnected from Aritech panel")
+
+    async def _async_teardown(self) -> None:
+        """Tear down the current connection without touching the shutdown flag.
+
+        Used both on unload and between reconnect attempts, so it must never
+        raise: a failing logout on a dead socket may not block a reconnect.
+        """
+        monitor, self._monitor = self._monitor, None
+        client, self._client = self._client, None
+        self._connected = False
+
+        if monitor:
+            try:
+                monitor.stop()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Error stopping monitor: %s", err)
+
+        if client:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_TIMEOUT)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Error disconnecting client: %s", err)
 
     def _setup_monitor_callbacks(self) -> None:
         """Set up callbacks for monitor events."""
         if not self._monitor:
             return
+
+        # Callbacks of a previous connection can still arrive after a
+        # reconnect; they must not take down the new connection.
+        client = self._client
 
         @self._monitor.on_initialized
         def handle_initialized(event: InitializedEvent) -> None:
@@ -254,13 +269,13 @@ class AritechCoordinator(DataUpdateCoordinator[AritechData]):
         @self._monitor.on_error
         def handle_error(error: Exception) -> None:
             _LOGGER.error("Aritech monitor error: %s", error)
-            self.hass.loop.call_soon_threadsafe(self._handle_connection_lost)
+            self.hass.loop.call_soon_threadsafe(self._handle_connection_lost, client)
 
         if self._client:
             @self._client.on_connection_lost
             def handle_connection_lost() -> None:
                 _LOGGER.warning("Aritech client connection lost detected")
-                self.hass.loop.call_soon_threadsafe(self._handle_connection_lost)
+                self.hass.loop.call_soon_threadsafe(self._handle_connection_lost, client)
 
     @callback
     def _handle_initialized(self, event: InitializedEvent) -> None:
@@ -289,9 +304,11 @@ class AritechCoordinator(DataUpdateCoordinator[AritechData]):
         self._initialized.set()
 
     @callback
-    def _handle_connection_lost(self) -> None:
+    def _handle_connection_lost(self, client: AritechClient | None = None) -> None:
         """Handle connection loss — mark disconnected and schedule reconnect."""
         if self._shutting_down:
+            return
+        if client is not None and client is not self._client:
             return
         self._connected = False
         self.async_set_updated_data(self._data)
@@ -322,39 +339,48 @@ class AritechCoordinator(DataUpdateCoordinator[AritechData]):
 
     @callback
     def _schedule_reconnect(self) -> None:
-        """Schedule a reconnection attempt with exponential backoff."""
+        """Start the reconnect loop unless it is already running."""
         if self._shutting_down:
             return
         if self._reconnect_task and not self._reconnect_task.done():
             return
 
-        delay = self._get_reconnect_delay()
-        self._reconnect_attempt += 1
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._async_reconnect_loop(), name=f"{DOMAIN}_reconnect"
+        )
 
-        async def reconnect() -> None:
+    async def _async_reconnect_loop(self) -> None:
+        """Keep trying to reconnect with exponential backoff until it works."""
+        while not self._shutting_down:
+            delay = self._get_reconnect_delay()
+            self._reconnect_attempt += 1
+            attempt = self._reconnect_attempt
+
             _LOGGER.info(
                 "Attempting to reconnect to Aritech panel in %d seconds (attempt %d)...",
-                delay, self._reconnect_attempt,
+                delay, attempt,
             )
             await asyncio.sleep(delay)
+            if self._shutting_down:
+                return
 
             try:
-                await self.async_disconnect(_from_reconnect=True)
+                await self._async_teardown()
                 await self.async_connect()
-                _LOGGER.info(
-                    "Reconnected to Aritech panel successfully after %d attempts",
-                    self._reconnect_attempt,
-                )
-            except Exception as err:
-                _LOGGER.error("Reconnection failed (attempt %d): %s", self._reconnect_attempt, err)
-                if self._reconnect_attempt >= self._max_reconnect_attempts:
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Reconnection failed (attempt %d): %s", attempt, err)
+                if attempt == self._max_reconnect_attempts:
                     _LOGGER.warning(
                         "Max reconnection attempts (%d) reached. Will continue retrying with max delay (%ds).",
                         self._max_reconnect_attempts, self._reconnect_delays[-1],
                     )
-                self._schedule_reconnect()
+                continue
 
-        self._reconnect_task = self.hass.async_create_task(reconnect())
+            _LOGGER.info(
+                "Reconnected to Aritech panel successfully after %d attempts", attempt
+            )
+            self.async_set_updated_data(self._data)
+            return
 
     async def _async_update_data(self) -> AritechData:
         """Fetch data from the panel (fallback, not normally used)."""
